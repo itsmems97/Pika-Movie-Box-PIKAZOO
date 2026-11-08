@@ -183,7 +183,7 @@ const $ = id => document.getElementById(id);
 /* downloaded file name: Pika-Movie-Update-<version>.apk */
 const makeName = v => v ? `Pika-Movie-Update-${v}.apk` : 'Pika-Movie-Update.apk';
 const clean = v => String(v).trim().replace(/^v/i,'').replace(/[^\w.+\-]/g,'');
-let VERSION = null;
+let VERSION = null, APK_SIZE = 0;
 
 /* app icon from repo (falls back to built-in SVG) */
 (function(){
@@ -192,7 +192,89 @@ let VERSION = null;
   im.src = RAW + encodeURIComponent(ICON);
 })();
 
-/* version: 1) version.json in repo  2) latest GitHub release tag */
+/* ── APK VERSION READER (reads versionName straight from the APK) ── */
+const _td = new TextDecoder();
+function readPool(v, o){
+  const n = v.getUint32(o+8,true), flags = v.getUint32(o+16,true),
+        ss = v.getUint32(o+20,true), hs = v.getUint16(o+2,true);
+  const utf8 = (flags & 0x100) !== 0, out = [];
+  for(let i=0;i<n;i++){
+    let p = o + ss + v.getUint32(o+hs+i*4, true);
+    if(utf8){
+      let l = v.getUint8(p++); if(l & 0x80) p++;
+      let bl = v.getUint8(p++); if(bl & 0x80) bl = ((bl & 0x7f) << 8) | v.getUint8(p++);
+      out.push(_td.decode(new Uint8Array(v.buffer, v.byteOffset + p, bl)));
+    }else{
+      let l = v.getUint16(p,true); p += 2;
+      if(l & 0x8000){ l = ((l & 0x7fff) << 16) | v.getUint16(p,true); p += 2; }
+      let t = ''; for(let j=0;j<l;j++) t += String.fromCharCode(v.getUint16(p+j*2,true));
+      out.push(t);
+    }
+  }
+  return out;
+}
+function axmlVersion(buf){
+  const v = new DataView(buf); let o = 8, strings = null;
+  while(o + 8 <= v.byteLength){
+    const type = v.getUint16(o,true), sz = v.getUint32(o+4,true);
+    if(type === 0x0001) strings = readPool(v,o);
+    else if(type === 0x0102 && strings && strings[v.getUint32(o+20,true)] === 'manifest'){
+      const as = v.getUint16(o+24,true), asz = v.getUint16(o+26,true), ac = v.getUint16(o+28,true);
+      for(let i=0;i<ac;i++){
+        const a = o + 16 + as + i*asz;
+        if(strings[v.getUint32(a+4,true)] === 'versionName'){
+          const raw = v.getUint32(a+8,true);
+          if(raw !== 0xFFFFFFFF) return strings[raw];
+          if(v.getUint8(a+15) === 3) return strings[v.getUint32(a+16,true)];
+        }
+      }
+      return null;
+    }
+    if(sz < 8) break; o += sz;
+  }
+  return null;
+}
+async function apkVersion(size, read){
+  const tailLen = Math.min(size, 66000), tailStart = size - tailLen;
+  const tail = new DataView(await read(tailStart, tailLen));
+  let e = -1;
+  for(let i=tailLen-22;i>=0;i--) if(tail.getUint32(i,true) === 0x06054b50){ e = i; break; }
+  if(e < 0) throw new Error('no zip');
+  const cdSize = tail.getUint32(e+12,true), cdOff = tail.getUint32(e+16,true);
+  const cd = cdOff >= tailStart ? new DataView(tail.buffer, cdOff - tailStart, cdSize)
+                                : new DataView(await read(cdOff, cdSize));
+  let p = 0, ent = null;
+  while(p + 46 <= cd.byteLength && cd.getUint32(p,true) === 0x02014b50){
+    const nl = cd.getUint16(p+28,true), xl = cd.getUint16(p+30,true), cl = cd.getUint16(p+32,true);
+    const name = _td.decode(new Uint8Array(cd.buffer, cd.byteOffset + p + 46, nl));
+    if(name === 'AndroidManifest.xml'){
+      ent = {method: cd.getUint16(p+10,true), cs: cd.getUint32(p+20,true), lo: cd.getUint32(p+42,true)};
+      break;
+    }
+    p += 46 + nl + xl + cl;
+  }
+  if(!ent) throw new Error('no manifest');
+  const lh = await read(ent.lo, ent.cs + 8192);
+  const L = new DataView(lh);
+  const start = 30 + L.getUint16(26,true) + L.getUint16(28,true);
+  if(start + ent.cs > lh.byteLength) throw new Error('short read');
+  let data = new Uint8Array(lh, start, ent.cs);
+  if(ent.method === 8){
+    data = new Uint8Array(await new Response(
+      new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
+  }
+  const ver = axmlVersion(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+  return ver ? clean(ver) : null;
+}
+/* read only the needed bytes of the remote APK (HTTP Range) */
+async function remoteRead(start, len){
+  const r = await fetch(RAW_URL, {headers:{Range:`bytes=${start}-${start+len-1}`}});
+  if(r.status !== 206){ try{ r.body.cancel(); }catch(e){} throw new Error('no range'); }
+  return r.arrayBuffer();
+}
+/* ── END APK READER ── */
+
+/* fallback version: 1) version.json in repo  2) latest GitHub release tag */
 async function detectVersion(){
   try{
     const r = await fetch(RAW + 'version.json?t=' + Date.now(), {cache:'no-store'});
@@ -216,6 +298,7 @@ async function fetchMeta(){
     if(r.status === 404) missing = true;
     else if(r.ok){
       const d = await r.json();
+      APK_SIZE = d.size;
       $('sizeText').textContent = (d.size/1048576).toFixed(1) + ' MB';
     }
   }catch(e){}
@@ -229,7 +312,9 @@ async function fetchMeta(){
   }
 
   // version
-  VERSION = await verP;
+  let apkVer = null;
+  if(APK_SIZE){ try{ apkVer = await apkVersion(APK_SIZE, remoteRead); }catch(e){} }
+  VERSION = apkVer || await verP;
   $('verText').textContent = VERSION ? 'v' + VERSION : 'Latest';
 
   // date
@@ -271,9 +356,12 @@ $('dlBtn').addEventListener('click', async function(e){
       bt.textContent = total ? `Downloading… ${Math.round(got/total*100)}%`
                              : `Downloading… ${(got/1048576).toFixed(1)} MB`;
     }
-    const url = URL.createObjectURL(new Blob(chunks,{type:'application/vnd.android.package-archive'}));
+    const blob = new Blob(chunks,{type:'application/vnd.android.package-archive'});
+    let dv = VERSION;
+    try{ const pv = await apkVersion(blob.size, (s,l)=>blob.slice(s,s+l).arrayBuffer()); if(pv) dv = pv; }catch(e){}
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = makeName(VERSION);
+    a.href = url; a.download = makeName(dv);
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(()=>URL.revokeObjectURL(url), 60000);
     bt.textContent = 'Download started ✓';
