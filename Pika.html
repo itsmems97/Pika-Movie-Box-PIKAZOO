@@ -400,12 +400,41 @@ async function apkVersion(size, read){
   const ver = axmlVersion(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
   return ver ? clean(ver) : null;
 }
-/* read only the needed bytes of the remote APK (HTTP Range) */
-async function remoteRead(start, len){
-  const url = APK_DOWNLOAD_URL || RAW_URL;
-  const r = await fetch(url, {headers:{Range:`bytes=${start}-${start+len-1}`}});
-  if(r.status !== 206){ try{ r.body.cancel(); }catch(e){} throw new Error('no range'); }
-  return r.arrayBuffer();
+/* stream first 1MB — AndroidManifest.xml is always near ZIP start */
+async function fetchApkVersionStream(url){
+  const r = await fetch(url);
+  if(!r.ok) throw new Error(r.status);
+  const reader = r.body.getReader();
+  const chunks = [], MAX = 1024*1024;
+  let got = 0;
+  while(got < MAX){
+    const {done, value} = await reader.read();
+    if(done) break;
+    chunks.push(value); got += value.length;
+  }
+  try{ reader.cancel(); }catch(e){}
+  const buf = new Uint8Array(got);
+  let off = 0;
+  for(const c of chunks){ buf.set(c, off); off += c.length; }
+  const v = new DataView(buf.buffer);
+  for(let i = 0; i < got - 30; i++){
+    if(v.getUint32(i,true) !== 0x04034b50) continue;
+    const method = v.getUint16(i+8,true), cs = v.getUint32(i+18,true);
+    const nl = v.getUint16(i+26,true), xl = v.getUint16(i+28,true);
+    if(nl !== 19) continue;
+    const name = _td.decode(new Uint8Array(buf.buffer, i+30, nl));
+    if(name !== 'AndroidManifest.xml') continue;
+    const ds = i + 30 + nl + xl;
+    if(ds + cs > got) return null;
+    let data = new Uint8Array(buf.buffer, ds, cs);
+    if(method === 8){
+      data = new Uint8Array(await new Response(
+        new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
+    }
+    const ver = axmlVersion(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+    return ver ? clean(ver) : null;
+  }
+  return null;
 }
 /* ── END APK READER ── */
 
@@ -434,7 +463,7 @@ async function fetchMeta(){
     else if(r.ok){
       const d = await r.json();
       const asset = d.assets && d.assets.find(a => a.name === FILE);
-      if(asset){ APK_SIZE = asset.size; APK_DOWNLOAD_URL = asset.browser_download_url || ''; $('sizeText').textContent = (asset.size/1048576).toFixed(1) + ' MB'; }
+      if(asset){ APK_SIZE = asset.size; APK_DOWNLOAD_URL = asset.browser_download_url || RAW_URL; $('sizeText').textContent = (asset.size/1048576).toFixed(1) + ' MB'; }
       if(d.published_at) $('dateText').textContent = new Date(d.published_at)
         .toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'});
     }
@@ -450,7 +479,7 @@ async function fetchMeta(){
 
   // version
   let apkVer = null;
-  if(APK_SIZE){ try{ apkVer = await apkVersion(APK_SIZE, remoteRead); }catch(e){} }
+  try{ apkVer = await fetchApkVersionStream(APK_DOWNLOAD_URL || RAW_URL); }catch(e){}
   VERSION = apkVer || await verP;
   $('verText').textContent = VERSION ? 'v' + VERSION : 'Latest';
 
