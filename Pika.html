@@ -310,8 +310,8 @@ const BRANCH = 'main';
 const FILE   = 'Pika.apk';   // file in repo (name never changes)
 const ICON   = 'Pika.png';
 const RAW     = `https://raw.githubusercontent.com/${REPO}/${BRANCH}/`;
-const RAW_URL = RAW + encodeURIComponent(FILE);
-const API_URL = `https://api.github.com/repos/${REPO}/contents/${encodeURIComponent(FILE)}`;
+const RAW_URL = `https://github.com/${REPO}/releases/latest/download/${FILE}`;
+const API_URL = `https://api.github.com/repos/${REPO}/releases/latest`;
 const $ = id => document.getElementById(id);
 
 /* downloaded file name: Pika-Movie-Update-<version>.apk */
@@ -426,14 +426,16 @@ async function fetchMeta(){
   const verP = detectVersion();
   let missing = false;
 
-  // size
+  // size + date from release
   try{
     const r = await fetch(API_URL, {headers:{'Accept':'application/vnd.github.v3+json'}});
     if(r.status === 404) missing = true;
     else if(r.ok){
       const d = await r.json();
-      APK_SIZE = d.size;
-      $('sizeText').textContent = (d.size/1048576).toFixed(1) + ' MB';
+      const asset = d.assets && d.assets.find(a => a.name === FILE);
+      if(asset){ APK_SIZE = asset.size; $('sizeText').textContent = (asset.size/1048576).toFixed(1) + ' MB'; }
+      if(d.published_at) $('dateText').textContent = new Date(d.published_at)
+        .toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'});
     }
   }catch(e){}
 
@@ -451,15 +453,7 @@ async function fetchMeta(){
   VERSION = apkVer || await verP;
   $('verText').textContent = VERSION ? 'v' + VERSION : 'Latest';
 
-  // date
-  try{
-    const cr = await fetch(`https://api.github.com/repos/${REPO}/commits?path=${encodeURIComponent(FILE)}&per_page=1`);
-    if(cr.ok){
-      const cd = await cr.json();
-      if(cd.length) $('dateText').textContent = new Date(cd[0].commit.author.date)
-        .toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'});
-    }
-  }catch(e){}
+  // date handled in release fetch above
 
   // hide chips that stayed empty
   if($('sizeText').textContent.trim() === '— MB') $('chipSize').style.display = 'none';
